@@ -1,0 +1,49 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/space-bunny-free",
+  "shell": "/bin/zsh",
+  "autoupdate": "notify",
+  "logLevel": "INFO",
+  "default_agent": "Dispatcher",
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git show*": "allow",
+      "git add*": "allow",
+      "git commit*": "allow",
+      "git push*main*": "deny",
+      "git push*master*": "deny",
+      "git push*develop*": "deny",
+      "git push*release*": "deny",
+      "git push*prod*": "deny",
+      "git push*production*": "deny",
+      "git push*live*": "deny",
+      "kubectl apply*": "deny",
+      "kubectl delete*": "deny",
+      "kubectl exec*": "deny",
+      "helm upgrade*": "deny",
+      "helm install*": "deny",
+      "terraform apply*": "deny",
+      "terraform destroy*": "deny",
+      "docker push*": "deny",
+      "cargo publish*": "deny",
+      "npm publish*": "deny",
+      "curl*169.254.169.254*": "deny",
+      "curl*metadata.google.internal*": "deny"
+    },
+    "external_directory": {
+      "*": "ask",
+      "~/.ssh/**": "deny",
+      "~/.aws/**": "deny",
+      "~/.config/gcloud/**": "deny",
+      "~/.kube/**": "deny",
+      "~/.gnupg/**": "deny"
+    },
+    "skill": {
+      "*": "allow"
+    }
+  }
+}
