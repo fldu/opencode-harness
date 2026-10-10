@@ -1,0 +1,4 @@
+# eval/ scripts are imported by the Makefile targets, so CPython writes bytecode
+# next to them on every run. Those are build artefacts, not source.
+__pycache__/
+*.pyc

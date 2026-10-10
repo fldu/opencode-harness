@@ -4,13 +4,38 @@ description: Central coordinator that manages issues and delegates work to speci
 model: "opencode/space-bunny-free"
 permission:
   "*": deny
-  read: allow
+  # `.env` is re-declared AFTER the wildcard: agent rules are appended after the
+  # global ones and the LAST match wins, so a bare `read: allow` lands last and
+  # wins over opencode's built-in `*.env` rule -- which is `ask`, not `deny`.
+  # The template allowances come after `*.env.*` or they are shadowed by it.
+  # `make check` A9 asserts the shape; SECURITY.md records why.
+  read: {
+    "*": allow,
+    "*.env": deny,
+    "*.env.*": deny,
+    "*.env.example": allow,
+    "*.env.sample": allow,
+    "*.env.template": allow
+  }
   grep: allow
   glob: allow
-  write: deny
   edit: deny
   bash: deny
-  skill: allow
+  # Skill access is enumerated, not open: only the skills in the "Load these
+  # skills" table below are permitted, everything else resolves to deny. A bare
+  # `skill: allow` would be appended after the global rules and void the whole
+  # block. Do not hand-edit independently; `make check` asserts this block and
+  # the table list the same skill names.
+  skill:
+    "*": deny
+    "delegation-gate": allow
+    "scope-control": allow
+    "new-task": allow
+    "issue-triage": allow
+    "delegation-router": allow
+    "parallel-delegation": allow
+    "escalation-rules": allow
+    "handoff-report": allow
   task: {
     "*": deny,
     "Sherlock": allow,
@@ -21,6 +46,19 @@ permission:
   }
   webfetch: allow
   websearch: allow
+  # External paths ask rather than deny, so an ordinary read of a sibling repo
+  # or of /etc reaches the operator instead of being refused with no prompt and
+  # no runtime override. The five credential paths are re-declared AFTER the
+  # wildcard for the same last-match-wins reason, so these named rules are the
+  # ones that win them. `make check` A8 asserts the shape; SECURITY.md.
+  external_directory: {
+    "*": ask,
+    "~/.ssh/**": deny,
+    "~/.aws/**": deny,
+    "~/.config/gcloud/**": deny,
+    "~/.kube/**": deny,
+    "~/.gnupg/**": deny
+  }
 ---
 
 # Orchestrator Agent
@@ -31,11 +69,16 @@ Triages incoming issues and delegates them to the five named agents; never write
 ## Tool Constraints
 **Allowed**: `read`, `grep`, `glob`, `skill`, `task` (Sherlock, Daedalus, Jeff, Michal, Jozef)
 **Denied**: `write`, `edit`, `bash` - Dispatcher does not modify the repository or run commands; every change is delegated
+**Note on `skill`**: access is enumerated, not open. Only the skills in the
+"Load these skills" table below resolve to allow; every other skill name
+resolves to deny, including skills that exist in the installed set but are not
+mine to load.
 
 ## Load these skills
 | Skill | When to load it |
 |---|---|
 | `delegation-gate`, `scope-control` | Always, before any dispatch |
+| `new-task` | Operator hands over a piece of work that needs triaging, sizing, and an owner |
 | `issue-triage` | Triaging an incoming issue |
 | `delegation-router` | Choosing and sequencing agents |
 | `parallel-delegation` | Running independent work concurrently |

@@ -5,6 +5,7 @@
   "autoupdate": "notify",
   "logLevel": "INFO",
   "default_agent": "Dispatcher",
+  "subagent_depth": 2,
   "permission": {
     "bash": {
       "*": "ask",
