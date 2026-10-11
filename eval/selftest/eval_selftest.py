@@ -94,14 +94,22 @@ DROP_LINE = '    "terraform destroy*": deny\n'
 # which would take every agent offline and prove nothing about resolution. A
 # broad pattern placed after the denies is the realistic form of this defect
 # anyway: someone widens an allowlist without noticing they put it downstream.
+#
+# opencode.json is V2-shaped: a flat `permissions` array of one-line
+# `{action, resource, effect}` objects, `shell` rather than `bash`, and `effect`
+# rather than a bare value. The agent files are still V1 frontmatter maps --
+# `bash:` blocks with `pattern: effect` pairs -- because V2 translates those
+# automatically and rewriting them would only churn the text the Makefile
+# parsers read. Both shapes are spelled out here for exactly that reason: one
+# shared constant would be a lie about one of the two files.
 ANCHOR = {
-    "opencode.json": '      "terraform destroy*": "deny",\n',
+    "opencode.json": '    { "action": "shell", "resource": "terraform destroy*", "effect": "deny" },\n',
     "agent/jeff.md": '    "terraform destroy*": deny\n',
     "agent/jozef.md": '    "terraform destroy*": deny\n',
     "agent/sherlock.md": '    "terraform destroy*": deny\n',
 }
 SHADOW = {
-    "opencode.json": '      "terraform*": "allow",\n',
+    "opencode.json": '    { "action": "shell", "resource": "terraform*", "effect": "allow" },\n',
     "agent/jeff.md": '    "terraform*": allow\n',
     "agent/jozef.md": '    "terraform*": allow\n',
     "agent/sherlock.md": '    "terraform*": allow\n',

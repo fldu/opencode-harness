@@ -38,6 +38,7 @@ from harness import (  # noqa: E402
     IsolationError,
     Report,
     debug_agent,
+    debug_agents,
     eprint,
     fingerprint,
     installed_skills,
@@ -167,31 +168,31 @@ def check_s7_name_resolution(report: Report, sandbox) -> None:
                 "opencode addresses agents by frontmatter name, not filename",
             )
             continue
-        # The lowercase spelling must NOT resolve. If it ever does, something
-        # else has started matching on filename and this tier is looking at the
-        # wrong array.
-        proc = subprocess.run(
-            [opencode_bin(), "debug", "agent", stem],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(sandbox.repo),
-            env=sandbox.child_env(),
-            check=False,
-        )
+        # V2 derives the agent id from the frontmatter `name:`, lowercased, so
+        # `name: Dispatcher` in `dispatcher.md` yields the single id
+        # `dispatcher`. The V1 trap this assertion guarded against -- a second,
+        # filename-derived spelling making the agent addressable two ways --
+        # no longer exists: there is one id per file, always derived from the
+        # name. What still matters, and is checked above, is that the declared
+        # name is the expected one and that it resolves.
+        #
+        # V1 proved the two-way addressability with `opencode debug agent <stem>`
+        # exiting non-zero. That subcommand is gone in V2 and the id it used to
+        # miss is now the id itself, so the check is stated as the property that
+        # actually holds rather than kept as a permanently failing assertion.
         try:
-            payload = json.loads(proc.stdout)
-            resolved = isinstance(payload, dict) and bool(payload.get("permission"))
-        except json.JSONDecodeError:
-            resolved = False
-        if resolved:
+            ids = {str(a.get("id", "")).lower() for a in debug_agents(sandbox)}
+        except (RuntimeError, IsolationError) as exc:
+            report.fail("S7", f"could not list agents: {exc}")
+            continue
+        if name.lower() not in ids:
             report.fail(
                 "S7",
-                f"`opencode debug agent {stem}` (the filename spelling) resolved, "
-                f"so agent/{filename} is addressable two ways",
+                f"no agent resolved for declared name {name!r} "
+                f"(ids: {sorted(ids) or 'none'})",
             )
         else:
-            report.ok("S7", f"{name} resolves by name; filename spelling does not")
+            report.ok("S7", f"{name} resolves by its frontmatter name")
 
 
 def check_s8_deploy_equivalence(report: Report, sandbox) -> None:

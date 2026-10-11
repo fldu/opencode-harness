@@ -23,9 +23,11 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,8 +37,14 @@ from pathlib import Path
 # agent) was checked by hand on this version only.
 VERIFIED_VERSION = "1.18.35"
 
+# V2 renamed the permission actions `bash` -> `shell` and `task` -> `subagent`
+# (and merged `write`/`patch` into `edit`). `debug_agent` maps them back so the
+# assertions below, which are written against the V1 names, keep their meaning.
+V2_ACTION_TO_V1 = {"shell": "bash", "subagent": "task"}
+
 # Agent IDs are the frontmatter `name:`, never the filename. This is the exact
-# set `opencode debug agent <ID>` must resolve.
+# set `opencode debug agents` must resolve. V2 lowercases them, so
+# `debug_agent` matches case-insensitively.
 AGENT_NAMES = ["Dispatcher", "Michal", "Sherlock", "Jeff", "Daedalus", "Jozef"]
 
 # Frontmatter name -> file basename. The two are spelled differently on
@@ -55,6 +63,12 @@ AGENT_FILES = {
 # assertion vacuously true. Floor guards against a config that parses to zero.
 MIN_RESOLVED_RULES = 40
 MIN_INSTALLED_SKILLS = 20
+
+# V2's background service answers `debug agents` with an empty list until it has
+# finished booting a cold sandbox. Retry a bounded number of times before
+# calling an agent unresolvable.
+SERVICE_BOOT_ATTEMPTS = 6
+SERVICE_BOOT_RETRY_SECONDS = 2.0
 
 
 # --------------------------------------------------------------------------
@@ -225,6 +239,25 @@ def _guard(sandbox_root: Path, real_home: Path) -> None:
         raise IsolationError(f"sandbox must not be the temp dir itself ({tmp})")
 
 
+def _pin_service_port(config: Path) -> int:
+    """Give the sandbox's background service a port nothing else is using.
+
+    Binds port 0 to let the kernel pick, reads the port back, closes it, and
+    writes it to the sandbox's own `service.json`. The window between closing
+    the probe socket and the child binding it is a TOCTOU race in principle; it
+    is not a security boundary here because the port only decides which
+    loopback socket the disposable child listens on, and a lost race would fail
+    the run loudly with an "address already in use" rather than pass quietly.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    (config / "service.json").write_text(
+        json.dumps({"port": port}), encoding="utf-8"
+    )
+    return port
+
+
 def make_sandbox(repo_root: Path, keep: bool = False) -> Sandbox:
     """Build an isolated HOME plus a disposable copy of the repository.
 
@@ -255,6 +288,17 @@ def make_sandbox(repo_root: Path, keep: bool = False) -> Sandbox:
         shutil.copy2(md, config / "agent" / md.name)
     shutil.copytree(repo_root / "skills", config / "skills", symlinks=True)
     shutil.copy2(repo_root / "opencode.json", config / "opencode.json")
+
+    # V2 runs a background service, and a sandboxed child defaults to the same
+    # port the operator's own service already holds. The child then fails to
+    # start and every assertion reports an opencode crash instead of a
+    # permission result. Pin a free port in the sandbox's own config so the two
+    # never collide.
+    #
+    # This is written directly rather than via `opencode service set port`,
+    # which restarts the service -- and that would take out the operator's own
+    # session, including the one running this suite.
+    _pin_service_port(config)
 
     sandbox = Sandbox(
         root=root,
@@ -315,45 +359,100 @@ def opencode_version(binary: str) -> str:
     ) else "unknown"
 
 
-def debug_agent(sandbox: Sandbox, name: str) -> list[dict]:
-    """The fully resolved rule array for one agent.
+def debug_agents(sandbox: Sandbox) -> list[dict]:
+    """Every agent the runtime resolves, retried until the list is non-empty.
 
-    `opencode debug agent <Name>` is the only supported way to see what V1
-    actually merged: global config rules first, then the agent's frontmatter,
-    last match wins. Asserting on the source files instead would be asserting
-    on our intent rather than on the runtime's behaviour, which is the whole
-    point of this tier.
+    V2's first `debug agents` against a cold sandbox returns an empty array
+    while the background service is still booting, and the second returns the
+    full set. Reading that first empty array as "these agents do not exist"
+    turns a startup race into a red tier, so retry until the service answers.
 
-    cwd is the disposable repo copy so the run sees exactly the tree the
-    behavioral tier will see, project config included.
+    Bounded by SERVICE_BOOT_ATTEMPTS rather than retried forever: an agent that
+    genuinely fails to load must surface as a failure, not hang the suite.
     """
     binary = opencode_bin()
     if not binary:
         raise IsolationError(
             "opencode is not on PATH. Set EVAL_OPENCODE_BIN to run the static tier."
         )
-    proc = subprocess.run(
-        [binary, "debug", "agent", name],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        cwd=str(sandbox.repo),
-        env=sandbox.child_env(),
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"`opencode debug agent {name}` exited {proc.returncode}: "
-            f"{proc.stderr.strip()[:400]}"
+    last_error = "no output"
+    for attempt in range(SERVICE_BOOT_ATTEMPTS):
+        proc = subprocess.run(
+            [binary, "debug", "agents"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(sandbox.repo),
+            env=sandbox.child_env(),
+            check=False,
         )
-    payload = json.loads(proc.stdout)
-    rules = payload.get("permission")
-    if not isinstance(rules, list) or not rules:
+        if proc.returncode != 0:
+            last_error = f"exited {proc.returncode}: {proc.stderr.strip()[:400]}"
+        else:
+            try:
+                agents = json.loads(proc.stdout)
+            except json.JSONDecodeError as exc:
+                last_error = f"invalid JSON: {exc}"
+            else:
+                if agents:
+                    return agents
+                last_error = "returned an empty agent list (service still starting)"
+        if attempt + 1 < SERVICE_BOOT_ATTEMPTS:
+            time.sleep(SERVICE_BOOT_RETRY_SECONDS)
+    raise RuntimeError(f"`opencode debug agents` {last_error}")
+
+
+def debug_agent(sandbox: Sandbox, name: str) -> list[dict]:
+    """The fully resolved rule array for one agent.
+
+    `opencode debug agents` is the only supported way to see what the runtime
+    actually merged: global config rules first, then the agent's frontmatter,
+    last match wins. Asserting on the source files instead would be asserting
+    on our intent rather than on the runtime's behaviour, which is the whole
+    point of this tier.
+
+    V1 exposed `opencode debug agent <Name>` returning `{permission: [...]}`
+    with `bash`/`task` action names. V2 removed that subcommand in favour of
+    `debug agents`, which lists every agent as `{id, permissions: [...]}` with
+    `{action, resource, effect}` rules and `shell`/`subagent` action names.
+
+    The resolved rules are normalised back into the V1
+    `{permission, pattern, action}` shape here, so `resolve()` and
+    `last_matching_index()` — and every assertion built on them — keep their
+    existing contract. `shell` maps back to `bash` and `subagent` back to
+    `task`, which is exactly the mapping the V2 migration guide documents.
+
+    cwd is the disposable repo copy so the run sees exactly the tree the
+    behavioral tier will see, project config included.
+    """
+    agents = debug_agents(sandbox)
+
+    # Agent IDs are the lowercased frontmatter name, so the frontmatter
+    # spelling (`Sherlock`) never matches an id (`sherlock`) literally.
+    wanted = name.strip().lower()
+    entry = next(
+        (a for a in agents if str(a.get("id", "")).lower() == wanted), None
+    )
+    if entry is None:
         raise RuntimeError(
-            f"`opencode debug agent {name}` returned no permission array; "
+            f"`opencode debug agents` has no agent named {name!r}; "
             "refusing to assert against an empty rule set"
         )
-    return rules
+
+    rules = entry.get("permissions")
+    if not isinstance(rules, list) or not rules:
+        raise RuntimeError(
+            f"agent {name!r} resolved to no permission array; "
+            "refusing to assert against an empty rule set"
+        )
+    return [
+        {
+            "permission": V2_ACTION_TO_V1.get(rule.get("action", ""), rule.get("action", "")),
+            "pattern": rule.get("resource", "*"),
+            "action": rule.get("effect", ""),
+        }
+        for rule in rules
+    ]
 
 
 # --------------------------------------------------------------------------

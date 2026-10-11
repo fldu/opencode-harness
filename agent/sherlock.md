@@ -65,11 +65,14 @@ permission:
     "*": "deny",
     "Jeff": "allow"
   }
-  # External paths ask rather than deny, so an ordinary read of a sibling repo
-  # or of /etc reaches the operator instead of being refused with no prompt and
-  # no runtime override. The five credential paths are re-declared AFTER the
-  # wildcard for the same last-match-wins reason, so these named rules are the
-  # ones that win them. `make check` A8 asserts the shape; SECURITY.md.
+  # External paths are hard-denied: no prompt, no runtime override, nothing
+  # outside the repo is reachable by any agent. That is the deliberate posture,
+  # and it is the same in all six agents -- A8 accepts `ask` or `deny` but
+  # requires one answer everywhere, so two agents can never disagree about it.
+  # The five credential paths are re-declared AFTER the wildcard for the
+  # last-match-wins reason: agent rules land after the global external_directory
+  # rules and win them, so only a named rule placed here can beat this wildcard.
+  # `make check` A8 asserts the shape and the order; SECURITY.md.
   external_directory: {
     "*": deny,
     "~/.ssh/**": deny,

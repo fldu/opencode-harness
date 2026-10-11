@@ -27,7 +27,7 @@ otherwise would be the exact kind of overclaim this file exists to avoid.
 | Credential paths (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.gnupg`) resolve to `deny` **through the agent's own named rule**, not through the `"*": deny` catch-all | `check` A8 | `eval-static` **S5** — gated, and it asserts the *winner is a named rule* |
 | Ordinary source files resolve to `read: allow` | `check` A9 | `eval-static` **S3** — probes `/tmp/probe.txt` |
 | `read` of `*.env` resolves to `deny` via a named rule, and `.env.example` resolves to `allow` | `check` A9 | **not gated.** S3 probes one ordinary path only. Verified by hand on 1.18.35 (resolved rule index 95 `read/*.env/deny`, 97 `read/*.env.example/allow`, against the `"*"` wildcard at 94); no committed assertion re-checks it |
-| Ordinary external paths (sibling repos, `/etc`, `$HOME` outside the project) resolve to **`ask`** | `check` A8 | **not gated.** S5 probes the credential paths only. Verified by hand on 1.18.35 (winner `external_directory/*/ask` at index 121 for Dispatcher); no committed assertion re-checks it |
+| Ordinary external paths (sibling repos, `/etc`, `$HOME` outside the project) resolve to **`deny`** — no prompt, no runtime override | `check` A8 | **not gated.** S5 probes the credential paths only. A8 asserts the declared rule and that all six agents agree on the wildcard; it does not read back the resolved winner. Changing a global rule to something that beats this wildcard would go uncaught by the eval tier |
 
 Note what is *not* in that table: **no row about `bash` and credentials.** The
 next section is that row.

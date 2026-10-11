@@ -219,18 +219,24 @@ endef
 #       point -- stripping a `task:` key outright has to FAIL, not extract zero
 #       from each side and call it a match.
 #   A8  every agent declares an OBJECT-FORM `external_directory` block whose
-#       rules are exactly `"*": ask` followed by the five credential paths as
-#       `deny` -- identical, and in identical order, in all six agents.
-#       Load-bearing, and this is the assertion A4's comment was written
-#       against: without the block, each agent's `"*": deny` (rule ~93) wins
-#       every external-directory question, so a sibling repo, /etc and the
-#       credential paths are all hard-denied with no operator prompt and no
-#       runtime override, and the five global credential denies at rules 87-91
-#       are shadowed in every case and contribute nothing. Order is the whole
-#       policy here, so the comparison is an ORDERED diff against one
-#       reference list, not a set diff -- `"*"` last would make the credential
-#       denies resolve to `ask`, a clickable prompt on `~/.aws/**`, which is
-#       strictly less safe than what it replaced.
+#       rules are exactly `"*": <ask|deny>` followed by the five credential
+#       paths as `deny` -- identical, and in identical order, in all six
+#       agents. The wildcard effect is read from the agents rather than
+#       hardcoded, but it must be ONE value across all six: `ask` prompts the
+#       operator for an external path, `deny` hard-blocks it with no prompt and
+#       no runtime override, and both are coherent policies, so the check
+#       accepts either and refuses only the states that are incoherent --
+#       agents that disagree, or an `allow` wildcard, which under
+#       last-match-wins would make the five credential denies below it
+#       unreachable. ORDER is the load-bearing part, and it is what this
+#       assertion was originally written against: agent rules land after the
+#       global external_directory rules and win them, so whatever the wildcard
+#       says is what resolves every external path, and the five global
+#       credential denies contribute nothing unless a named rule here beats it.
+#       Hence the comparison is an ORDERED diff against one reference list, not
+#       a set diff, and the wildcard must come first -- `"*"` last would make
+#       the credential denies resolve to the wildcard, turning a hard block on
+#       ~/.aws/** into a clickable prompt.
 #   A9  every agent declares an OBJECT-FORM `read` block whose first rule is
 #       `"*": allow`, which contains `*.env: deny` and `*.env.*: deny`, and in
 #       which every `*.env.example` / `*.env.sample` / `*.env.template` allow
@@ -302,21 +308,44 @@ CREDENTIAL_DENIES_N := $(words $(CREDENTIAL_DENIES))
 # their ORDER rather than pinning which ones exist.
 MIN_READ_RULES := 3
 
-# AWK_JSON_BASH: awk source printing the deny patterns of `permission.bash` from
-# an opencode.json, one per line, in file order; reports the counts to stderr.
+# AWK_JSON_BASH: awk source printing the deny patterns of the `shell` permission
+# rules from an opencode.json, one per line, in file order; reports the counts to
+# stderr.
+#
+# Native V2 shape: `permissions` is a flat ordered array of
+# `{action, resource, effect}` objects, so there is no `"bash": {` block to
+# descend into. Rules are written one object per line by hand, so a single line
+# carries the whole rule and the fields are extracted positionally. A rule split
+# across lines is NOT recognised; AWK_JSON_BASH_FORMATTING below fails the run
+# loudly rather than comparing an empty list against anything.
 define AWK_JSON_BASH
-	/"bash"[[:space:]]*:[[:space:]]*{/ { inb = 1; next } \
-	inb && /^[[:space:]]*}/ { inb = 0; next } \
-	!inb { next } \
-	/^[[:space:]]*"/ { \
-	  s = $$0; sub(/^[[:space:]]*"/, "", s); \
-	  q = index(s, "\""); if (q == 0) next; \
-	  pat = substr(s, 1, q - 1); \
-	  a = substr(s, q + 1); \
-	  sub(/^[[:space:]]*:[[:space:]]*"?/, "", a); sub(/"?[[:space:]]*,?[[:space:]]*$$/, "", a); \
-	  n++; if (a == "deny") { print pat; c++ } \
+	/"action"[[:space:]]*:[[:space:]]*"shell"/ { \
+	  s = $$0; \
+	  if (match(s, /"resource"[[:space:]]*:[[:space:]]*"[^"]*"/) == 0) next; \
+	  pat = substr(s, RSTART, RLENGTH); \
+	  sub(/^"resource"[[:space:]]*:[[:space:]]*"/, "", pat); sub(/"$$/, "", pat); \
+	  eff = ""; \
+	  if (match(s, /"effect"[[:space:]]*:[[:space:]]*"[^"]*"/) > 0) { \
+	    eff = substr(s, RSTART, RLENGTH); \
+	    sub(/^"effect"[[:space:]]*:[[:space:]]*"/, "", eff); sub(/"$$/, "", eff); \
+	  } \
+	  n++; if (eff == "deny") { print pat; c++ } \
 	} \
 	END { printf "check:   read %d rule(s), %d deny pattern(s) from %s\n", n + 0, c + 0, FILENAME > "/dev/stderr"; }
+endef
+
+# AWK_JSON_BASH_FORMATTING: awk source verifying every `permissions` entry in an
+# opencode.json sits on a single line, which is what AWK_JSON_BASH assumes. One
+# `{` with no matching `}` on the same line means the array was re-serialised
+# pretty-printed and the extraction above would silently read zero patterns.
+define AWK_JSON_BASH_FORMATTING
+	/"permissions"[[:space:]]*:[[:space:]]*\[/ { inp = 1; next } \
+	inp && /^[[:space:]]*\]/ { inp = 0 } \
+	inp && /\{/ { \
+	  n = gsub(/\{/, "{"); m = gsub(/\}/, "}"); \
+	  if (n != m) { printf "multi-line rule\n"; bad++ } \
+	} \
+	END { printf "check:   %d multi-line permission rule(s) in %s\n", bad + 0, FILENAME > "/dev/stderr"; }
 endef
 
 # AWK_YAML_BASH: awk source printing the deny patterns of an agent file's
@@ -605,9 +634,9 @@ define CHECK_CMDS
 	global=$$(awk '$(AWK_JSON_BASH)' "$(SRC)/opencode.json"); \
 	printf '%s\n' "$$global" > "$$tmp/global.txt"; \
 	gcount=$$(awk 'length($$0) > 0 { c++ } END { print c + 0 }' "$$tmp/global.txt"); \
-	gfirst=$$(awk '/"bash"[[:space:]]*:[[:space:]]*{/ { inb = 1; next } inb && /^[[:space:]]*}/ { inb = 0 } inb && /^[[:space:]]*"/ { s = $$0; sub(/^[[:space:]]*"/, "", s); sub(/".*/, "", s); print s; exit }' "$(SRC)/opencode.json"); \
+	gfirst=$$(awk '/"action"[[:space:]]*:[[:space:]]*"shell"/ { s = $$0; if (match(s, /"resource"[[:space:]]*:[[:space:]]*"[^"]*"/) == 0) next; pat = substr(s, RSTART, RLENGTH); sub(/^"resource"[[:space:]]*:[[:space:]]*"/, "", pat); sub(/"$$/, "", pat); print pat; exit }' "$(SRC)/opencode.json"); \
 	if [ "$$gfirst" != '*' ]; then \
-		printf 'FAIL A2: %s/opencode.json permission.bash first key is `%s`.\n' "$(SRC)" "$${gfirst:-<none>}" >&2; \
+		printf 'FAIL A2: %s/opencode.json first shell rule resource is `%s`.\n' "$(SRC)" "$${gfirst:-<none>}" >&2; \
 		printf 'FAIL A2: expected: "*" — under last-match-wins a later wildcard shadows any earlier rule.\n' >&2; \
 		fail=1; \
 	fi; \
@@ -617,6 +646,11 @@ define CHECK_CMDS
 		fail=1; \
 	elif [ "$$gcount" -lt "$(MIN_DENY)" ]; then \
 		printf 'FAIL A3: %s/opencode.json has %d deny pattern(s), expected at least %d.\n' "$(SRC)" "$$gcount" "$(MIN_DENY)" >&2; \
+		fail=1; \
+	fi; \
+	if [ "$$(awk '$(AWK_JSON_BASH_FORMATTING)' "$(SRC)/opencode.json")" != '' ]; then \
+		printf 'FAIL A3: %s/opencode.json has a permission rule split across lines.\n' "$(SRC)" >&2; \
+		printf 'FAIL A3: expected one `{action, resource, effect}` object per line. AWK_JSON_BASH reads a rule from a single line and would silently extract 0 patterns.\n' >&2; \
 		fail=1; \
 	fi; \
 	filesn=$$(printf '%s\n' $(AGENTS_ALL) | awk 'length($$0) > 0 { c++ } END { print c + 0 }'); \
@@ -639,7 +673,28 @@ define CHECK_CMDS
 			fail=1; \
 		fi; \
 	fi; \
-	awk -v 'pats=$(CREDENTIAL_DENIES)' 'BEGIN { n = split(pats, a, " "); print "*\task"; for (i = 1; i <= n; i++) print a[i] "\tdeny" }' > "$$tmp/extdir.ref.txt"; \
+	: > "$$tmp/extdir.wilds.txt"; \
+	for a in $(AGENTS_ALL); do \
+		f="$(SRC)/agent/$$a.md"; \
+		if [ ! -f "$$f" ]; then continue; fi; \
+		e=$$(awk 'NR == 1 && $$0 == "---" { fm = 1; next } NR == 1 { fm = 0 } fm && $$0 == "---" { fm = 0; next } !fm { next } /^  external_directory:[[:space:]]*$$/ { inb = 1; next } /^  external_directory:[[:space:]]*\{/ { inb = 1; next } inb && /^  [^[:space:]#]/ { inb = 0 } inb && /^    [^[:space:]#]/ { s = $$0; sub(/^[[:space:]]*/, "", s); sub(/,[[:space:]]*$$/, "", s); if (s ~ /^"\*":[[:space:]]*[a-z]+$$/) { sub(/^"\*":[[:space:]]*/, "", s); print s } exit }' "$$f"); \
+		printf '%s\n' "$$e" >> "$$tmp/extdir.wilds.txt"; \
+	done; \
+	xtwild=$$(awk 'length($$0) > 0 && !seen[$$0]++ { print }' "$$tmp/extdir.wilds.txt" | head -n 1); \
+	xtwildn=$$(awk 'length($$0) > 0 && !seen[$$0]++ { c++ } END { print c + 0 }' "$$tmp/extdir.wilds.txt"); \
+	if [ "$$xtwildn" -gt 1 ]; then \
+		printf 'FAIL A8: the agents do not agree on the external_directory wildcard effect.\n' >&2; \
+		printf '      distinct wildcard effect(s) found: %s\n' "$$(tr '\n' ' ' < "$$tmp/extdir.wilds.txt")" >&2; \
+		printf 'FAIL A8: the whole policy has to be declared identically. Two agents whose wildcards differ differ in posture, and the ordering this check protects is only meaningful if there is one ordering.\n' >&2; \
+		fail=1; \
+	fi; \
+	case " $$xtwild " in \
+		" ask "|" deny "|"") ;; \
+		*) printf 'FAIL A8: the external_directory wildcard effect is `%s`, expected `ask` or `deny`.\n' "$$xtwild" >&2; \
+		   printf 'FAIL A8: `ask` prompts the operator for an external path; `deny` hard-blocks it with no prompt and no runtime override. Both are coherent policies. `allow` is not: it would make every credential deny below it unreachable, since last-match-wins would resolve them all to allow.\n' >&2; \
+		   fail=1 ;; \
+	esac; \
+	awk -v 'pats=$(CREDENTIAL_DENIES)' -v "w=$$xtwild" 'BEGIN { n = split(pats, a, " "); print "*\t" (w == "" ? "?" : w); for (i = 1; i <= n; i++) print a[i] "\tdeny" }' > "$$tmp/extdir.ref.txt"; \
 	xrefn=$$(awk 'length($$0) > 0 { c++ } END { print c + 0 }' "$$tmp/extdir.ref.txt"); \
 	if [ "$$xrefn" -eq 0 ]; then \
 		printf 'FAIL A8: built an empty external_directory reference list.\n' >&2; \
@@ -749,7 +804,7 @@ define CHECK_CMDS
 		case "$$xfirst" in \
 			'"*": '*|*'"*":'*) ;; \
 			*) printf 'FAIL A8: %s external_directory block first key is `%s`.\n' "$$f" "$${xfirst:-<none>}" >&2; \
-			   printf 'FAIL A8: expected: "*" first (e.g. "*": ask). A wildcard placed after a named rule shadows it under last-match-wins, so every credential path would resolve to ask -- a clickable prompt on ~/.aws/** instead of the hard block it is supposed to be.\n' >&2; \
+			   printf 'FAIL A8: expected: "*" first (e.g. "*": deny). A wildcard placed after a named rule shadows it under last-match-wins, so the credential path resolves to the wildcard -- with an `ask` wildcard, a clickable prompt on ~/.aws/** instead of the hard block it is supposed to be.\n' >&2; \
 			   fail=1 ;; \
 		esac; \
 		xperm=$$(awk '$(AWK_YAML_EXTDIR)' "$$f"); \
@@ -757,13 +812,13 @@ define CHECK_CMDS
 		xpermn=$$(awk 'length($$0) > 0 { c++ } END { print c + 0 }' "$$tmp/$$a.extdir.txt"); \
 		if [ "$$xpermn" -eq 0 ]; then \
 			printf 'FAIL A8: extracted 0 rule(s) from the external_directory block of %s.\n' "$$f" >&2; \
-			printf 'FAIL A8: expected an object-form `external_directory:` block -- `"*": ask` first, then the %d credential deny pattern(s). A bare `external_directory: ask` scalar, or no key at all, both extract nothing. Refusing to compare an empty block against the reference list.\n' "$(CREDENTIAL_DENIES_N)" >&2; \
+			printf 'FAIL A8: expected an object-form `external_directory:` block -- `"*": %s` first, then the %d credential deny pattern(s). A bare `external_directory: ask` scalar, or no key at all, both extract nothing. Refusing to compare an empty block against the reference list.\n' "$$xtwild" "$(CREDENTIAL_DENIES_N)" >&2; \
 			fail=1; \
 		elif [ "$$xrefn" -gt 0 ] && ! diff -u "$$tmp/extdir.ref.txt" "$$tmp/$$a.extdir.txt" > "$$tmp/xd.txt" 2>&1; then \
 			printf 'FAIL A8: the external_directory block of %s is not the expected rules in the expected order.\n' "$$f" >&2; \
-			printf '      expected %d rule(s): "*": ask, then the credential denies in order. This block has %d. Difference:\n' "$$xrefn" "$$xpermn" >&2; \
+			printf '      expected %d rule(s): "*": %s, then the credential denies in order. This block has %d. Difference:\n' "$$xrefn" "$$xtwild" "$$xpermn" >&2; \
 			sed -n '/^@@/,$$p' "$$tmp/xd.txt" | sed 's/^/      /' >&2; \
-			printf 'FAIL A8: every agent must declare this block identically and in order. A bare `"*": deny` catch-all lands after the global external_directory rules and wins them, which is what left every external path -- and every credential path -- hard-denied with no prompt; and a credential deny placed before the wildcard is shadowed by its own wildcard, which is worse.\n' >&2; \
+			printf 'FAIL A8: every agent must declare this block identically and in order. The wildcard must come FIRST: agent rules land after the global external_directory rules and win them, so a wildcard placed after a named rule shadows that rule under last-match-wins. Two shapes are wrong. `"*": deny` makes every external path hard-denied with no prompt and no runtime override, and shadows the %d global credential denies so they contribute nothing; `"*": ask` prompts the operator for every external path but keeps the credential denies load-bearing. Both are coherent -- which one is in force must simply be the same in all six agents. `"*"` LAST is the defect this check exists for: it turns the credential denies below it into `ask`, a clickable prompt on ~/.aws/**.\n' "$(CREDENTIAL_DENIES_N)" >&2; \
 			fail=1; \
 		fi; \
 		rfirst=$$(awk 'NR == 1 && $$0 == "---" { fm = 1; next } NR == 1 { fm = 0 } fm && $$0 == "---" { fm = 0; next } !fm { next } /^  read:[[:space:]]*$$/ { inb = 1; next } /^  read:[[:space:]]*\{/ { inb = 1; next } inb && /^    [^[:space:]#]/ { s = $$0; sub(/^[[:space:]]*/, "", s); print s; exit }' "$$f"); \
